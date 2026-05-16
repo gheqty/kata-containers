@@ -137,11 +137,24 @@ func (dv *directVolume) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 	if kataVolType == utils.DirectVolumeTypeName {
 		kataVolType = "blk"
 	}
+
+	// Forward the pod's fsGroup (sent by kubelet because we advertise
+	// VOLUME_MOUNT_GROUP in NodeGetCapabilities) so kata-agent chowns
+	// the fresh filesystem root after mount.
+	kataMetadata := attrib
+	if mv := req.GetVolumeCapability().GetMount(); mv != nil && mv.GetVolumeMountGroup() != "" {
+		kataMetadata = make(map[string]string, len(attrib)+1)
+		for k, v := range attrib {
+			kataMetadata[k] = v
+		}
+		kataMetadata["fsGroup"] = mv.GetVolumeMountGroup()
+	}
+
 	mountInfo := utils.MountInfo{
 		VolumeType: kataVolType,
 		Device:     devicePath,
 		FsType:     fsType,
-		Metadata:   attrib,
+		Metadata:   kataMetadata,
 		Options:    nil,
 	}
 	if err := utils.AddDirectVolume(targetPath, mountInfo); err != nil {
@@ -360,6 +373,19 @@ func (dv *directVolume) NodeGetCapabilities(ctx context.Context, req *csi.NodeGe
 			Type: &csi.NodeServiceCapability_Rpc{
 				Rpc: &csi.NodeServiceCapability_RPC{
 					Type: csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+				},
+			},
+		},
+		{
+			// Tells kubelet that NodePublishVolume should be called
+			// with VolumeMountGroup set to the pod's fsGroup. We
+			// forward the value to kata-agent so it chowns the fresh
+			// fs root to that gid after mount (otherwise the freshly
+			// formatted ext4 root is owned by uid:gid 0:0 and non-
+			// root containers fail with EACCES on first write).
+			Type: &csi.NodeServiceCapability_Rpc{
+				Rpc: &csi.NodeServiceCapability_RPC{
+					Type: csi.NodeServiceCapability_RPC_VOLUME_MOUNT_GROUP,
 				},
 			},
 		},
