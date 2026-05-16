@@ -120,13 +120,29 @@ func (dv *directVolume) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, status.Error(codes.Aborted, errMsg)
 	}
 
-	// kata-containers DirectVolume add
+	// kata-containers DirectVolume add.
+	//
+	// VolumeType "directvol" causes kata-agent to stage the device at
+	// /run/kata-containers/sandbox/storage/<id> and bind-mount it onto
+	// the container path. On confidential-computing runtimes where the
+	// PodVM rootfs is read-only (dm-verity), that staging directory
+	// cannot be created and the mount fails with ENOTDIR. Tell kata to
+	// use "blk" instead, which direct-mounts the device as fsType to
+	// the container path. The host-side bind-mount above is unaffected.
+	//
+	// Options passed to kata are also stripped of "bind"/"rw" — those
+	// describe the host-side CSI bind-mount, not the guest-side fs
+	// mount kata performs.
+	kataVolType := volType
+	if kataVolType == utils.DirectVolumeTypeName {
+		kataVolType = "blk"
+	}
 	mountInfo := utils.MountInfo{
-		VolumeType: volType,
+		VolumeType: kataVolType,
 		Device:     devicePath,
 		FsType:     fsType,
 		Metadata:   attrib,
-		Options:    options,
+		Options:    nil,
 	}
 	if err := utils.AddDirectVolume(targetPath, mountInfo); err != nil {
 		klog.Errorf("add direct volume with source %s and mountInfo %v failed", targetPath, mountInfo)
