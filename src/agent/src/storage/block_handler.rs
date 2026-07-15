@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 #[cfg(target_arch = "s390x")]
 use kata_types::device::DRIVER_BLK_CCW_TYPE;
 use kata_types::device::{
@@ -65,6 +65,16 @@ async fn handle_block_storage(
     storage: &Storage,
     dev_num: &str,
 ) -> Result<Arc<dyn StorageDevice>> {
+    // A non-"ephemeral" `encryption_key=<uri>` (kbs://) selects a PERSISTENT
+    // on-device LUKS2 volume whose passphrase is released by CDH after the
+    // guest is attested. First use formats the device; later boots re-open the
+    // same ciphertext. Encrypted + persistent + unprivileged (the measured
+    // agent mounts, so the workload needs no CAP_SYS_ADMIN). This is distinct
+    // from the "ephemeral" path below, which wipes the device every boot.
+    if let Some(key_uri) = persistent_luks_key_uri(storage) {
+        return persistent_luks_storage(logger, storage, key_uri).await;
+    }
+
     let options = block_storage_driver_options(storage)?;
 
     if options.has_ephemeral_encryption {
@@ -160,6 +170,174 @@ async fn ensure_ext4_filesystem(logger: &Logger, source: &str) -> Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+/// Search path for cryptsetup / mkfs. The confidential GPU rootfs ships them
+/// under /usr/sbin and /sbin.
+const STORAGE_TOOL_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
+
+/// A persistent LUKS key URI, if `driver_options` carries `encryption_key=<uri>`
+/// with a value other than the "ephemeral" literal. Delivered from a
+/// direct-volume's `metadata.encryptionKey`.
+fn persistent_luks_key_uri(storage: &Storage) -> Option<&str> {
+    storage
+        .driver_options
+        .iter()
+        .find_map(|o| o.strip_prefix("encryption_key="))
+        .filter(|v| !v.is_empty() && *v != "ephemeral")
+}
+
+/// Deterministic /dev/mapper name derived from the mount point (FNV-1a), so a
+/// re-open within the same PodVM finds a stable name and cannot collide with an
+/// unrelated volume.
+fn luks_mapper_name(mount_point: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in mount_point.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("kcache-{:016x}", h)
+}
+
+/// Fetch the LUKS passphrase referenced by a `kbs://` URI from CDH. CDH only
+/// releases it once the guest quote satisfies the KBS resource policy, so the
+/// key never exists on the host.
+async fn fetch_luks_key(key_uri: &str) -> Result<Vec<u8>> {
+    if !crate::confidential_data_hub::is_cdh_client_initialized() {
+        bail!("CDH client not initialized; cannot resolve persistent LUKS key {key_uri}");
+    }
+    match key_uri.strip_prefix("kbs://") {
+        // get_cdh_resource re-prepends "kbs://", so pass the remainder.
+        Some(path) => crate::confidential_data_hub::get_cdh_resource(path)
+            .await
+            .with_context(|| format!("CDH get_resource for {key_uri}")),
+        None => bail!("unsupported persistent LUKS key scheme in {key_uri} (only kbs:// is supported)"),
+    }
+}
+
+/// Run a cryptsetup subcommand with an optional passphrase on stdin. Mirrors
+/// `ensure_ext4_filesystem`: holds WAIT_PID_LOCKER so the agent SIGCHLD handler
+/// does not reap the child before tokio observes it.
+async fn run_cryptsetup(args: &[&str], stdin_data: Option<&[u8]>) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let _locker = rustjail::container::WAIT_PID_LOCKER.lock().await;
+    let mut cmd = tokio::process::Command::new("cryptsetup");
+    cmd.args(args)
+        .env("PATH", STORAGE_TOOL_PATH)
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("spawn cryptsetup")?;
+    if let Some(data) = stdin_data {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("no stdin handle for cryptsetup"))?;
+        stdin
+            .write_all(data)
+            .await
+            .context("write passphrase to cryptsetup")?;
+        // Drop closes the pipe so cryptsetup sees EOF.
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .context("wait for cryptsetup")?;
+    if !output.status.success() {
+        bail!(
+            "cryptsetup {:?} failed: status={}, stderr={}",
+            args,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// True if `device` already carries a LUKS2 header (formatted on a previous
+/// boot). Never errors — a blank device is simply "not LUKS".
+async fn device_is_luks(device: &str) -> bool {
+    let _locker = rustjail::container::WAIT_PID_LOCKER.lock().await;
+    tokio::process::Command::new("cryptsetup")
+        .args(["isLuks", device])
+        .env("PATH", STORAGE_TOOL_PATH)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Open (or, on first use, format) a persistent on-device LUKS2 volume with a
+/// KBS-released passphrase, then mount the decrypted mapper via the normal
+/// block-storage path. Unprivileged from the workload's point of view.
+async fn persistent_luks_storage(
+    logger: &Logger,
+    storage: &Storage,
+    key_uri: &str,
+) -> Result<Arc<dyn StorageDevice>> {
+    let device = storage.source.clone();
+    if device.is_empty() {
+        bail!("persistent-luks: storage source device is empty");
+    }
+
+    let passphrase = fetch_luks_key(key_uri).await?;
+    let mapper = luks_mapper_name(&storage.mount_point);
+    let mapper_path = format!("/dev/mapper/{mapper}");
+
+    if device_is_luks(&device).await {
+        info!(logger, "persistent-luks: opening existing LUKS2 volume";
+            "device" => device.as_str(), "mapper" => mapper.as_str());
+        run_cryptsetup(&["luksOpen", "-d", "-", device.as_str(), mapper.as_str()], Some(&passphrase))
+            .await
+            .context("luksOpen existing volume")?;
+    } else {
+        info!(logger, "persistent-luks: formatting new LUKS2 volume (first use)";
+            "device" => device.as_str(), "mapper" => mapper.as_str());
+        run_cryptsetup(
+            &[
+                "--batch-mode",
+                "luksFormat",
+                "--type",
+                "luks2",
+                "--cipher",
+                "aes-xts-plain64",
+                "--sector-size",
+                "4096",
+                device.as_str(),
+                "-",
+            ],
+            Some(&passphrase),
+        )
+        .await
+        .context("luksFormat new volume")?;
+        run_cryptsetup(&["luksOpen", "-d", "-", device.as_str(), mapper.as_str()], Some(&passphrase))
+            .await
+            .context("luksOpen after format")?;
+        ensure_ext4_filesystem(logger, &mapper_path)
+            .await
+            .context("mkfs.ext4 on new volume")?;
+    }
+
+    // Mount the plaintext mapper device via the normal block-storage path. Drop
+    // our synthetic driver option so it is not mistaken for a mount option.
+    let mut mapped = storage.clone();
+    mapped.source = mapper_path;
+    if mapped.fstype.is_empty() {
+        mapped.fstype = "ext4".to_string();
+    }
+    mapped.driver_options = Vec::new();
+    let path = common_storage_handler(logger, &mapped)?;
+    new_device(path)
 }
 
 #[cfg(test)]
